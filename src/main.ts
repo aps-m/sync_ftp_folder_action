@@ -40,6 +40,8 @@ export async function run(): Promise<void> {
               console.log(`Access denied!`)
               core.setFailed(err.message)
             }
+          } else {
+            core.setFailed('Unknown error while remove directory')
           }
         })
 
@@ -49,11 +51,14 @@ export async function run(): Promise<void> {
           console.log('Directory successfuly sync!')
         })
         .catch(err => {
+          console.log(`Failed to copy to remote directory`)
           if (err instanceof FTPError) {
             if (err.code === 550) {
               console.log(`Access denied!`)
               core.setFailed(err.message)
             }
+          } else {
+            core.setFailed('Unknown error while copy files')
           }
         })
     } catch (err) {
@@ -64,6 +69,8 @@ export async function run(): Promise<void> {
       if (err instanceof Error) {
         console.log(err.message)
         core.setFailed(err.message)
+      } else {
+        core.setFailed('Unknown error')
       }
     }
 

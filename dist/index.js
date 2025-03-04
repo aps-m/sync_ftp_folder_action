@@ -27139,6 +27139,9 @@ async function run() {
                         core.setFailed(err.message);
                     }
                 }
+                else {
+                    core.setFailed('Unknown error while remove directory');
+                }
             });
             await client
                 .uploadFromDir(src_path, dst_path)
@@ -27146,11 +27149,15 @@ async function run() {
                 console.log('Directory successfuly sync!');
             })
                 .catch(err => {
+                console.log(`Failed to copy to remote directory`);
                 if (err instanceof basic_ftp_1.FTPError) {
                     if (err.code === 550) {
                         console.log(`Access denied!`);
                         core.setFailed(err.message);
                     }
+                }
+                else {
+                    core.setFailed('Unknown error while copy files');
                 }
             });
         }
@@ -27161,6 +27168,9 @@ async function run() {
             if (err instanceof Error) {
                 console.log(err.message);
                 core.setFailed(err.message);
+            }
+            else {
+                core.setFailed('Unknown error');
             }
         }
         client.close();
