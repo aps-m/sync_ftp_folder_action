@@ -27116,7 +27116,7 @@ async function run() {
         const src_path = core.getInput('src_path');
         const dst_path = core.getInput('dst_path');
         const client = new basic_ftp_1.Client(timeout);
-        client.ftp.verbose = true;
+        // client.ftp.verbose = true
         try {
             await client.access({
                 host: host,
@@ -27133,6 +27133,12 @@ async function run() {
             })
                 .catch(err => {
                 console.log(`Failed to remove ${dst_path} directory`);
+                if (err instanceof basic_ftp_1.FTPError) {
+                    if (err.code === 550) {
+                        console.log(`Access denied!`);
+                        core.setFailed(err.message);
+                    }
+                }
             });
             await client
                 .uploadFromDir(src_path, dst_path)
@@ -27140,7 +27146,12 @@ async function run() {
                 console.log('Directory successfuly sync!');
             })
                 .catch(err => {
-                console.log(err);
+                if (err instanceof basic_ftp_1.FTPError) {
+                    if (err.code === 550) {
+                        console.log(`Access denied!`);
+                        core.setFailed(err.message);
+                    }
+                }
             });
         }
         catch (err) {

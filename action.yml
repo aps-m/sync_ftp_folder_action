@@ -32,7 +32,7 @@ inputs:
   timeout:
     description: 'Action timeout in milliseconds'
     required: true
-    default: 5000
+    default: 10000
 
   src_path:
     description: 'Local folder path'

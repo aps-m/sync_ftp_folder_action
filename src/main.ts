@@ -16,7 +16,7 @@ export async function run(): Promise<void> {
     const dst_path: string = core.getInput('dst_path')
 
     const client = new FtpClient(timeout)
-    client.ftp.verbose = true
+    // client.ftp.verbose = true
 
     try {
       await client.access({
@@ -35,6 +35,12 @@ export async function run(): Promise<void> {
         })
         .catch(err => {
           console.log(`Failed to remove ${dst_path} directory`)
+          if (err instanceof FTPError) {
+            if (err.code === 550) {
+              console.log(`Access denied!`)
+              core.setFailed(err.message)
+            }
+          }
         })
 
       await client
@@ -43,7 +49,12 @@ export async function run(): Promise<void> {
           console.log('Directory successfuly sync!')
         })
         .catch(err => {
-          console.log(err)
+          if (err instanceof FTPError) {
+            if (err.code === 550) {
+              console.log(`Access denied!`)
+              core.setFailed(err.message)
+            }
+          }
         })
     } catch (err) {
       // if (err instanceof FTPError) {
