@@ -1,5 +1,5 @@
 import * as core from '@actions/core'
-import { wait } from './wait'
+import { Client as FtpClient, FTPError } from 'basic-ftp'
 
 /**
  * The main function for the action.
@@ -7,18 +7,56 @@ import { wait } from './wait'
  */
 export async function run(): Promise<void> {
   try {
-    const ms: string = core.getInput('milliseconds')
+    const host: string = core.getInput('host')
+    const user: string = core.getInput('user')
+    const port: number = Number(core.getInput('port'))
+    const password: string = core.getInput('password')
+    const timeout: number = Number(core.getInput('timeout'))
+    const src_path: string = core.getInput('src_path')
+    const dst_path: string = core.getInput('dst_path')
 
-    // Debug logs are only output if the `ACTIONS_STEP_DEBUG` secret is true
-    core.debug(`Waiting ${ms} milliseconds ...`)
+    const client = new FtpClient(timeout)
+    client.ftp.verbose = true
 
-    // Log the current timestamp, wait, then log the new timestamp
-    core.debug(new Date().toTimeString())
-    await wait(parseInt(ms, 10))
-    core.debug(new Date().toTimeString())
+    try {
+      await client.access({
+        host: host,
+        user: user,
+        password: password,
+        secure: false,
+        secureOptions: undefined,
+        port: port
+      })
 
-    // Set outputs for other workflow steps to use
-    core.setOutput('time', new Date().toTimeString())
+      await client
+        .removeDir(dst_path)
+        .then(() => {
+          console.log(`Directory ${dst_path} removed`)
+        })
+        .catch(err => {
+          console.log(`Failed to remove ${dst_path} directory`)
+        })
+
+      await client
+        .uploadFromDir(src_path, dst_path)
+        .then(() => {
+          console.log('Directory successfuly sync!')
+        })
+        .catch(err => {
+          console.log(err)
+        })
+    } catch (err) {
+      // if (err instanceof FTPError) {
+      //   console.log(err.message)
+      // }
+
+      if (err instanceof Error) {
+        console.log(err.message)
+        core.setFailed(err.message)
+      }
+    }
+
+    client.close()
   } catch (error) {
     // Fail the workflow run if an error occurs
     if (error instanceof Error) core.setFailed(error.message)

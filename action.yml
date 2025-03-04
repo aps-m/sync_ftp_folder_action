@@ -1,23 +1,47 @@
-name: 'The name of your action here'
-description: 'Provide a description here'
-author: 'Your name or organization here'
+name: 'sync_ftp_folder_action'
+description: 'Sync a folder to an FTP server'
+author: 'aps-m'
 
 # Add your action's branding here. This will appear on the GitHub Marketplace.
 branding:
-  icon: 'heart'
-  color: 'red'
+  icon: 'folder'
+  color: 'orange'
 
 # Define your inputs here.
 inputs:
-  milliseconds:
-    description: 'Your input description here'
+  host:
+    description: 'FTP server host'
     required: true
-    default: '1000'
+    default: 'localhost'
 
-# Define your outputs here.
-outputs:
-  time:
-    description: 'Your output description here'
+  port:
+    description: 'FTP server port'
+    required: true
+    default: 21
+
+  user:
+    description: 'FTP authorization user'
+    required: true
+    default: 'anonymous'
+
+  password:
+    description: 'FTP authorization password'
+    required: true
+    default: ''
+
+  timeout:
+    description: 'Action timeout in milliseconds'
+    required: true
+    default: 5000
+
+  src_path:
+    description: 'Local folder path'
+    required: true
+
+  dst_path:
+    description: 'Remote folder path'
+    required: true
+    default: '.'
 
 runs:
   using: node20
