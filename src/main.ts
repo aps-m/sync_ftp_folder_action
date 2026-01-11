@@ -37,8 +37,11 @@ export async function run(): Promise<void> {
           console.log(`Failed to remove ${dst_path} directory`)
           if (err instanceof FTPError) {
             if (err.code === 550) {
-              console.log(`Access denied!`)
-              core.setFailed(err.message)
+              if (err.message.includes('Directory not found')) {
+                console.log(`${err.message}`)
+              } else {
+                core.setFailed(err.message)
+              }
             }
           } else {
             core.setFailed('Unknown error while remove directory')
@@ -54,8 +57,11 @@ export async function run(): Promise<void> {
           console.log(`Failed to copy to remote directory`)
           if (err instanceof FTPError) {
             if (err.code === 550) {
-              console.log(`Access denied!`)
-              core.setFailed(err.message)
+              if (err.message.includes('Directory not found')) {
+                console.log(`${err.message}`)
+              } else {
+                core.setFailed(err.message)
+              }
             }
           } else {
             core.setFailed('Unknown error while copy files')
