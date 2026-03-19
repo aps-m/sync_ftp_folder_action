@@ -1,89 +1,101 @@
 /**
  * Unit tests for the action's main functionality, src/main.ts
- *
- * These should be run as if the action was called from a workflow.
- * Specifically, the inputs listed in `action.yml` should be set as environment
- * variables following the pattern `INPUT_<INPUT_NAME>`.
  */
 
 import * as core from '@actions/core'
 import * as main from '../src/main'
 
-// Mock the action's main function
+const mockAccess = jest.fn()
+const mockRemoveDir = jest.fn()
+const mockUploadFromDir = jest.fn()
+const mockClose = jest.fn()
+
+jest.mock('basic-ftp', () => ({
+  Client: jest.fn().mockImplementation(() => ({
+    access: mockAccess,
+    removeDir: mockRemoveDir,
+    uploadFromDir: mockUploadFromDir,
+    close: mockClose
+  })),
+  FTPError: class extends Error {
+    code: number
+
+    constructor(message: string, code: number) {
+      super(message)
+      this.code = code
+    }
+  }
+}))
+
 const runMock = jest.spyOn(main, 'run')
 
-// Other utilities
-const timeRegex = /^\d{2}:\d{2}:\d{2}/
-
-// Mock the GitHub Actions core library
-let debugMock: jest.SpiedFunction<typeof core.debug>
-let errorMock: jest.SpiedFunction<typeof core.error>
-let getInputMock: jest.SpiedFunction<typeof core.getInput>
 let setFailedMock: jest.SpiedFunction<typeof core.setFailed>
-let setOutputMock: jest.SpiedFunction<typeof core.setOutput>
+let consoleLogMock: jest.SpiedFunction<typeof console.log>
 
 describe('action', () => {
   beforeEach(() => {
     jest.clearAllMocks()
 
-    debugMock = jest.spyOn(core, 'debug').mockImplementation()
-    errorMock = jest.spyOn(core, 'error').mockImplementation()
-    getInputMock = jest.spyOn(core, 'getInput').mockImplementation()
+    jest.spyOn(core, 'getInput').mockImplementation(name => {
+      switch (name) {
+        case 'host':
+          return 'ftp.example.com'
+        case 'user':
+          return 'deploy'
+        case 'port':
+          return '21'
+        case 'password':
+          return 'secret'
+        case 'timeout':
+          return '5000'
+        case 'src_path':
+          return './dist'
+        case 'dst_path':
+          return '/remote/dist'
+        default:
+          return ''
+      }
+    })
     setFailedMock = jest.spyOn(core, 'setFailed').mockImplementation()
-    setOutputMock = jest.spyOn(core, 'setOutput').mockImplementation()
+    consoleLogMock = jest.spyOn(console, 'log').mockImplementation()
   })
 
-  it('sets the time output', async () => {
-    // Set the action's inputs as return values from core.getInput()
-    getInputMock.mockImplementation(name => {
-      switch (name) {
-        case 'milliseconds':
-          return '500'
-        default:
-          return ''
-      }
-    })
+  it('connects to ftp and uploads directory', async () => {
+    mockAccess.mockResolvedValue(undefined)
+    mockRemoveDir.mockResolvedValue(undefined)
+    mockUploadFromDir.mockResolvedValue(undefined)
 
     await main.run()
-    expect(runMock).toHaveReturned()
 
-    // Verify that all of the core library functions were called correctly
-    expect(debugMock).toHaveBeenNthCalledWith(1, 'Waiting 500 milliseconds ...')
-    expect(debugMock).toHaveBeenNthCalledWith(
-      2,
-      expect.stringMatching(timeRegex)
+    expect(runMock).toHaveReturned()
+    expect(mockAccess).toHaveBeenCalledWith({
+      host: 'ftp.example.com',
+      user: 'deploy',
+      password: 'secret',
+      secure: false,
+      secureOptions: undefined,
+      port: 21
+    })
+    expect(mockRemoveDir).toHaveBeenCalledWith('/remote/dist')
+    expect(mockUploadFromDir).toHaveBeenCalledWith('./dist', '/remote/dist')
+    expect(mockClose).toHaveBeenCalledTimes(1)
+    expect(setFailedMock).not.toHaveBeenCalled()
+    expect(consoleLogMock).toHaveBeenCalledWith(
+      'Directory /remote/dist removed'
     )
-    expect(debugMock).toHaveBeenNthCalledWith(
-      3,
-      expect.stringMatching(timeRegex)
-    )
-    expect(setOutputMock).toHaveBeenNthCalledWith(
-      1,
-      'time',
-      expect.stringMatching(timeRegex)
-    )
-    expect(errorMock).not.toHaveBeenCalled()
+    expect(consoleLogMock).toHaveBeenCalledWith('Directory successfuly sync!')
   })
 
-  it('sets a failed status', async () => {
-    // Set the action's inputs as return values from core.getInput()
-    getInputMock.mockImplementation(name => {
-      switch (name) {
-        case 'milliseconds':
-          return 'this is not a number'
-        default:
-          return ''
-      }
-    })
+  it('sets failed status when ftp access throws', async () => {
+    mockAccess.mockRejectedValue(new Error('connect failed'))
 
     await main.run()
-    expect(runMock).toHaveReturned()
 
-    // Verify that all of the core library functions were called correctly
-    expect(setFailedMock).toHaveBeenNthCalledWith(
-      1,
-      'milliseconds not a number'
-    )
-    expect(errorMock).not.toHaveBeenCalled()
+    expect(runMock).toHaveReturned()
+    expect(mockRemoveDir).not.toHaveBeenCalled()
+    expect(mockUploadFromDir).not.toHaveBeenCalled()
+    expect(mockClose).toHaveBeenCalledTimes(1)
+    expect(setFailedMock).toHaveBeenCalledWith('connect failed')
+    expect(consoleLogMock).toHaveBeenCalledWith('connect failed')
   })
 })
