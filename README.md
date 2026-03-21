@@ -17,7 +17,7 @@
 
 ```yml
 - name: Sync folder with test files
-  uses: aps-m/sync_ftp_folder_action@main
+  uses: aps-m/sync_ftp_folder_action@v1
   with:
     host: localhost
     timeout: 60000
