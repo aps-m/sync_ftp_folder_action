@@ -3459,13 +3459,13 @@ const path_1 = __nccwpck_require__(1017);
 const tls_1 = __nccwpck_require__(4404);
 const util_1 = __nccwpck_require__(3837);
 const FtpContext_1 = __nccwpck_require__(9052);
+const netUtils_1 = __nccwpck_require__(6288);
+const parseControlResponse_1 = __nccwpck_require__(9948);
 const parseList_1 = __nccwpck_require__(2993);
+const parseListMLSD_1 = __nccwpck_require__(8157);
 const ProgressTracker_1 = __nccwpck_require__(7170);
 const StringWriter_1 = __nccwpck_require__(8184);
-const parseListMLSD_1 = __nccwpck_require__(8157);
-const netUtils_1 = __nccwpck_require__(6288);
 const transfer_1 = __nccwpck_require__(5803);
-const parseControlResponse_1 = __nccwpck_require__(9948);
 // Use promisify to keep the library compatible with Node 8.
 const fsReadDir = (0, util_1.promisify)(fs_1.readdir);
 const fsMkDir = (0, util_1.promisify)(fs_1.mkdir);
@@ -3474,7 +3474,8 @@ const fsOpen = (0, util_1.promisify)(fs_1.open);
 const fsClose = (0, util_1.promisify)(fs_1.close);
 const fsUnlink = (0, util_1.promisify)(fs_1.unlink);
 const defaultClientOptions = {
-    allowSeparateTransferHost: true
+    allowSeparateTransferHost: true,
+    maxListingBytes: 40 * 1024 * 1024
 };
 const LIST_COMMANDS_DEFAULT = () => ["LIST -a", "LIST"];
 const LIST_COMMANDS_MLSD = () => ["MLSD", "LIST -a", "LIST"];
@@ -3487,13 +3488,15 @@ class Client {
      *
      * @param timeout  Timeout in milliseconds, use 0 for no timeout. Optional, default is 30 seconds.
      */
-    constructor(timeout = 30000, options = defaultClientOptions) {
+    constructor(timeout = 30000, userOptions = defaultClientOptions) {
         this.availableListCommands = LIST_COMMANDS_DEFAULT();
+        const options = { ...defaultClientOptions, ...userOptions };
         this.ftp = new FtpContext_1.FTPContext(timeout);
         this.prepareTransfer = this._enterFirstCompatibleMode([
             transfer_1.enterPassiveModeIPv6,
             options.allowSeparateTransferHost ? transfer_1.enterPassiveModeIPv4 : transfer_1.enterPassiveModeIPv4_forceControlHostIP
         ]);
+        this.options = options;
         this.parseList = parseList_1.parseList;
         this._progressTracker = new ProgressTracker_1.ProgressTracker();
     }
@@ -3967,7 +3970,7 @@ class Client {
      * @protected
      */
     async _requestListWithCommand(command) {
-        const buffer = new StringWriter_1.StringWriter();
+        const buffer = new StringWriter_1.StringWriter(this.options.maxListingBytes);
         await (0, transfer_1.downloadTo)(buffer, {
             ftp: this.ftp,
             tracker: this._progressTracker,
@@ -4518,6 +4521,10 @@ class FTPContext {
      * Send an FTP command without waiting for or handling the result.
      */
     send(command) {
+        // Reject control character injection attempts.
+        if (/[\r\n\0]/.test(command)) {
+            throw new Error(`Invalid command: Contains control characters. (${command})`);
+        }
         const containsPassword = command.startsWith("PASS");
         const message = containsPassword ? "> PASS ###" : `> ${command}`;
         this.log(message);
@@ -4809,21 +4816,27 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.StringWriter = void 0;
 const stream_1 = __nccwpck_require__(2781);
 class StringWriter extends stream_1.Writable {
-    constructor() {
-        super(...arguments);
-        this.buf = Buffer.alloc(0);
+    constructor(maxByteLength = 1 * 1024 * 1024) {
+        super();
+        this.maxByteLength = maxByteLength;
+        this.byteLength = 0;
+        this.bufs = [];
     }
     _write(chunk, _, callback) {
-        if (chunk instanceof Buffer) {
-            this.buf = Buffer.concat([this.buf, chunk]);
-            callback(null);
+        if (!(chunk instanceof Buffer)) {
+            callback(new Error("StringWriter: expects chunks of type 'Buffer'."));
+            return;
         }
-        else {
-            callback(new Error("StringWriter expects chunks of type 'Buffer'."));
+        if (this.byteLength + chunk.byteLength > this.maxByteLength) {
+            callback(new Error(`StringWriter: Maximum bytes exceeded, maxByteLength=${this.maxByteLength}.`));
+            return;
         }
+        this.byteLength += chunk.byteLength;
+        this.bufs.push(chunk);
+        callback(null);
     }
     getText(encoding) {
-        return this.buf.toString(encoding);
+        return Buffer.concat(this.bufs).toString(encoding);
     }
 }
 exports.StringWriter = StringWriter;
@@ -33680,13 +33693,11 @@ async function run() {
             catch (err) {
                 console.log(`Failed to remove ${dst_path} directory`);
                 if (err instanceof basic_ftp_1.FTPError) {
-                    if (err.code === 550) {
-                        if (err.message.includes('Directory not found')) {
-                            console.log(`${err.message}`);
-                        }
-                        else {
-                            core.setFailed(err.message);
-                        }
+                    if (err.code === 550 && err.message.includes('Directory not found')) {
+                        console.log(`${err.message}`);
+                    }
+                    else {
+                        core.setFailed(`FTP error (code ${err.code}): ${err.message}`);
                     }
                 }
                 else {
@@ -33700,14 +33711,7 @@ async function run() {
             catch (err) {
                 console.log(`Failed to copy to remote directory`);
                 if (err instanceof basic_ftp_1.FTPError) {
-                    if (err.code === 550) {
-                        if (err.message.includes('Directory not found')) {
-                            console.log(`${err.message}`);
-                        }
-                        else {
-                            core.setFailed(err.message);
-                        }
-                    }
+                    core.setFailed(`FTP error (code ${err.code}): ${err.message}`);
                 }
                 else {
                     core.setFailed('Unknown error while copy files');
@@ -33715,9 +33719,6 @@ async function run() {
             }
         }
         catch (err) {
-            // if (err instanceof FTPError) {
-            //   console.log(err.message)
-            // }
             if (err instanceof Error) {
                 console.log(err.message);
                 core.setFailed(err.message);

@@ -34,12 +34,10 @@ export async function run(): Promise<void> {
       } catch (err) {
         console.log(`Failed to remove ${dst_path} directory`)
         if (err instanceof FTPError) {
-          if (err.code === 550) {
-            if (err.message.includes('Directory not found')) {
-              console.log(`${err.message}`)
-            } else {
-              core.setFailed(err.message)
-            }
+          if (err.code === 550 && err.message.includes('Directory not found')) {
+            console.log(`${err.message}`)
+          } else {
+            core.setFailed(`FTP error (code ${err.code}): ${err.message}`)
           }
         } else {
           core.setFailed('Unknown error while remove directory')
@@ -52,22 +50,12 @@ export async function run(): Promise<void> {
       } catch (err) {
         console.log(`Failed to copy to remote directory`)
         if (err instanceof FTPError) {
-          if (err.code === 550) {
-            if (err.message.includes('Directory not found')) {
-              console.log(`${err.message}`)
-            } else {
-              core.setFailed(err.message)
-            }
-          }
+          core.setFailed(`FTP error (code ${err.code}): ${err.message}`)
         } else {
           core.setFailed('Unknown error while copy files')
         }
       }
     } catch (err) {
-      // if (err instanceof FTPError) {
-      //   console.log(err.message)
-      // }
-
       if (err instanceof Error) {
         console.log(err.message)
         core.setFailed(err.message)
