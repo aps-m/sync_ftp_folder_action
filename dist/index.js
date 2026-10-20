@@ -3470,11 +3470,13 @@ const transfer_1 = __nccwpck_require__(5803);
 const fsReadDir = (0, util_1.promisify)(fs_1.readdir);
 const fsMkDir = (0, util_1.promisify)(fs_1.mkdir);
 const fsStat = (0, util_1.promisify)(fs_1.stat);
+const fsFStat = (0, util_1.promisify)(fs_1.fstat);
 const fsOpen = (0, util_1.promisify)(fs_1.open);
 const fsClose = (0, util_1.promisify)(fs_1.close);
 const fsUnlink = (0, util_1.promisify)(fs_1.unlink);
 const defaultClientOptions = {
-    allowSeparateTransferHost: true,
+    /** For security reasons this library should not allow separate transfer hosts by default. */
+    allowSeparateTransferHost: false,
     maxListingBytes: 40 * 1024 * 1024
 };
 const LIST_COMMANDS_DEFAULT = () => ["LIST -a", "LIST"];
@@ -3542,7 +3544,17 @@ class Client {
      * explicit TLS. There are still FTP servers that support only implicit TLS, though.
      */
     connectImplicitTLS(host = "localhost", port = 21, tlsOptions = {}) {
+        var _a;
         this.ftp.reset();
+        // Remember the host identity so future data connections can resume this TLS
+        // session. Since Node.js v24.17.0 (CVE-2026-48934) a reusable TLS session is
+        // bound to the host it was authenticated for, and resumption is refused when
+        // the resuming connection's identity (servername ?? host ?? socket._host)
+        // differs. Data connections connect to the PASV/EPSV target, so without an
+        // explicit host they'd resume under a different (or missing) identity and the
+        // server would report the session as not resumed. This mirrors what `access`
+        // already does for explicit TLS, see https://github.com/patrickjuchli/basic-ftp/issues/166.
+        tlsOptions.host = (_a = tlsOptions.host) !== null && _a !== void 0 ? _a : host;
         this.ftp.socket = (0, tls_1.connect)(port, host, tlsOptions, () => this.ftp.log(`Connected to ${(0, netUtils_1.describeAddress)(this.ftp.socket)} (${(0, netUtils_1.describeTLS)(this.ftp.socket)})`));
         this.ftp.tlsOptions = tlsOptions;
         return this._handleConnectResponse();
@@ -3839,7 +3851,16 @@ class Client {
             autoClose: false
         });
         try {
-            return await this._uploadFromStream(source, remotePath, command);
+            const expectedBytes = await expectedBytesFromLocalFile(fd, options);
+            const response = await this._uploadFromStream(source, remotePath, command);
+            // A local file that is modified while it is being read results in an incomplete
+            // upload. Neither the FTP server nor the data connection can detect this, the
+            // transfer just ends early and is reported as successful. Compare what we read
+            // with what we expected to read to turn this into an error instead.
+            if (expectedBytes !== undefined && source.bytesRead !== expectedBytes) {
+                throw new Error(`Local file "${localPath}" changed while it was being uploaded to "${remotePath}": expected to send ${expectedBytes} bytes but sent ${source.bytesRead}. The remote file is incomplete.`);
+            }
+            return response;
         }
         finally {
             await ignoreError(() => fsClose(fd));
@@ -4227,6 +4248,24 @@ async function ensureLocalDirectory(path) {
         await fsMkDir(path, { recursive: true });
     }
 }
+/**
+ * Return how many bytes an upload should read from an open local file, taking the optional
+ * range described by `options` into account. Returns `undefined` if the size can't be known
+ * upfront, for example because the source is a pipe or another non-regular file.
+ */
+async function expectedBytesFromLocalFile(fd, options) {
+    var _a;
+    const stats = await fsFStat(fd);
+    if (!stats.isFile()) {
+        return undefined;
+    }
+    const start = (_a = options.localStart) !== null && _a !== void 0 ? _a : 0;
+    // `localEndInclusive` beyond the end of the file just means "read until the end".
+    const endExclusive = options.localEndInclusive !== undefined
+        ? Math.min(options.localEndInclusive + 1, stats.size)
+        : stats.size;
+    return Math.max(0, endExclusive - start);
+}
 async function ignoreError(func) {
     try {
         return await func();
@@ -4348,6 +4387,7 @@ FileInfo.UnixPermission = {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.FTPContext = exports.FTPError = void 0;
 const net_1 = __nccwpck_require__(1808);
+const tls_1 = __nccwpck_require__(4404);
 const parseControlResponse_1 = __nccwpck_require__(9948);
 /**
  * Describes an FTP server error response including the FTP response code.
@@ -4387,6 +4427,8 @@ class FTPContext {
         this.ipFamily = undefined;
         /** Options for TLS connections. */
         this.tlsOptions = {};
+        /** Most recent TLS session from the control connection, used to resume the session on data connections. */
+        this.tlsSessionStore = undefined;
         /** A multiline response might be received as multiple chunks. */
         this._partialResponse = "";
         this._encoding = encoding;
@@ -4452,6 +4494,7 @@ class FTPContext {
         this.dataSocket = undefined;
         // This being a reset, reset any other state apart from the socket.
         this.tlsOptions = {};
+        this.tlsSessionStore = undefined;
         this._partialResponse = "";
         if (this._socket) {
             const newSocketUpgradesExisting = socket.localPort === this._socket.localPort;
@@ -4479,6 +4522,9 @@ class FTPContext {
             socket.on("close", hadError => { if (!hadError)
                 this.closeWithError(new Error("Server closed connection unexpectedly.")); });
             this._setupDefaultErrorHandlers(socket, "control socket");
+            if (socket instanceof tls_1.TLSSocket) {
+                socket.on("session", session => { this.tlsSessionStore = session; });
+            }
         }
         this._socket = socket;
     }
@@ -4560,16 +4606,27 @@ class FTPContext {
             // they called this method by mistake.
         }
         return new Promise((resolveTask, rejectTask) => {
+            // A task can only be settled once. A handler can still hold on to its resolver after
+            // that, for example because a stream reports an error late. By then the next task
+            // might be running already and stopping to track it would leave it without a response.
+            let settled = false;
+            const stopTrackingOnce = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                this._stopTrackingTask();
+            };
             this._task = {
                 stack: new Error().stack || "Unknown call stack",
                 responseHandler,
                 resolver: {
                     resolve: arg => {
-                        this._stopTrackingTask();
+                        stopTrackingOnce();
                         resolveTask(arg);
                     },
                     reject: err => {
-                        this._stopTrackingTask();
+                        stopTrackingOnce();
                         rejectTask(err);
                     }
                 }
@@ -4850,6 +4907,118 @@ exports.StringWriter = StringWriter;
 
 /***/ }),
 
+/***/ 7926:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TransferWatchdog = void 0;
+/** How long to wait between two checks of a transfer at most, in milliseconds. */
+const maxCheckIntervalMs = 500;
+/**
+ * How many checks a timeout is split into, at least. A transfer is only reported as stalled if
+ * every single one of them found the connection idle. Deciding on a single check would make brief
+ * moments where a transfer looks idle without being stalled matter, for example just after a
+ * destination signalled that it can accept data again but before the first bytes arrived.
+ *
+ * Splitting into n checks means such a moment has to last about (n-1)/n of the timeout to be
+ * mistaken for a stall, so the value matters much less than it being greater than one. It only
+ * has an effect on timeouts below `minChecksPerTimeout * maxCheckIntervalMs` anyway, longer ones
+ * are split into more checks by the interval limit alone.
+ */
+const minChecksPerTimeout = 4;
+/**
+ * Watches a data connection during a transfer and reports it as stalled if the server stopped
+ * making progress.
+ *
+ * This replaces a plain inactivity timeout on the data socket. Such a timeout can't tell apart
+ * "the server stopped sending" from "our own source or destination isn't ready yet". A slow local
+ * stream is not an error: A download piped into a decompressor, or an upload fed by a stream that
+ * computes its data, can legitimately leave the connection idle for minutes. Timing out on that
+ * kills a healthy transfer and truncates the data the destination already received.
+ *
+ * Only time spent waiting for the server counts towards the timeout, see `isWaitingForServer`.
+ */
+class TransferWatchdog {
+    constructor() {
+        this.timer = undefined;
+    }
+    /**
+     * Start watching a transfer. Calls `onStall` if the server hasn't made progress for
+     * `timeout` milliseconds, or for twice that if we made it wait ourselves before that.
+     * A timeout of 0 disables the watchdog.
+     */
+    start(socket, direction, timeout, onStall) {
+        this.stop();
+        if (timeout <= 0) {
+            return;
+        }
+        const intervalMs = Math.max(1, Math.min(Math.floor(timeout / minChecksPerTimeout), maxCheckIntervalMs));
+        let lastBytes = countBytes(socket);
+        let idleMs = 0;
+        let graceMs = 0;
+        this.timer = setInterval(() => {
+            const bytes = countBytes(socket);
+            const madeProgress = bytes !== lastBytes;
+            lastBytes = bytes;
+            if (!isWaitingForServer(socket, direction)) {
+                // We're the ones holding up the transfer. The server won't continue the moment
+                // we're ready again: our backpressure closed the receive window and it only
+                // learns that it reopened with its next probe, so grant that on top of timeout.
+                idleMs = 0;
+                graceMs = timeout;
+                return;
+            }
+            if (madeProgress) {
+                idleMs = 0;
+                graceMs = 0;
+                return;
+            }
+            // Count checks instead of measuring elapsed time: a blocked event loop delays our
+            // checks just as much as it delays reading from the socket, and that's not something
+            // the server should be blamed for.
+            idleMs += intervalMs;
+            if (idleMs >= timeout + graceMs) {
+                this.stop();
+                onStall();
+            }
+        }, intervalMs);
+        // Don't keep the process alive just to watch a transfer.
+        this.timer.unref();
+    }
+    /**
+     * Stop watching. Safe to call at any time, also if no transfer is being watched.
+     */
+    stop() {
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+        }
+    }
+}
+exports.TransferWatchdog = TransferWatchdog;
+function countBytes(socket) {
+    return socket.bytesRead + socket.bytesWritten;
+}
+/**
+ * Returns true if the transfer can only continue once the server acts. When downloading, that's
+ * the case as long as we're ready to receive: if the socket is paused, our destination applied
+ * backpressure and the server may well be waiting for us. When uploading, it's the case if we
+ * still have data queued that the server isn't accepting: an empty queue means we're waiting for
+ * our own source instead.
+ *
+ * `isPaused()` only reports backpressure for a socket that is being piped, which is what
+ * `downloadTo` in transfer.ts does. Should that ever change to reading the socket directly, e.g.
+ * by iterating over it, this would report a transfer as stalled while it's waiting for us.
+ */
+function isWaitingForServer(socket, direction) {
+    return direction === "download" ? !socket.isPaused() : socket.writableLength > 0;
+}
+
+
+/***/ }),
+
 /***/ 7957:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -4895,6 +5064,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.describeTLS = describeTLS;
 exports.describeAddress = describeAddress;
 exports.upgradeSocket = upgradeSocket;
+exports.isLoopback = isLoopback;
 exports.ipIsPrivateV4Address = ipIsPrivateV4Address;
 const tls_1 = __nccwpck_require__(4404);
 /**
@@ -4938,6 +5108,12 @@ function upgradeSocket(socket, options) {
             reject(error);
         });
     });
+}
+/**
+ * Returns true if an IP address is a loopback address.
+ */
+function isLoopback(ip) {
+    return ip === "::1" || ip.startsWith("127.");
 }
 /**
  * Returns true if an IP is a private address according to https://tools.ietf.org/html/rfc1918#section-3.
@@ -5136,8 +5312,13 @@ const FileInfo_1 = __nccwpck_require__(202);
  * under the Apache 2.0 license. It has been simplified and rewritten to better fit the Javascript language.
  *
  * https://github.com/apache/commons-net/blob/master/src/main/java/org/apache/commons/net/ftp/parser/NTFTPEntryParser.java
+ *
+ * Keep this expression anchored: without it a line that can't be parsed is retried at every position,
+ * and as the expression starts with `\S+` each attempt is itself linear in the length of the line. A
+ * single long line without whitespace would cost O(n²), which a server could use to block the event loop.
  */
-const RE_LINE = new RegExp("(\\S+)\\s+(\\S+)\\s+" // MM-dd-yy whitespace hh:mma|kk:mm swallow trailing spaces
+const RE_LINE = new RegExp("^\\s*" // anchor, `testLine` below is even stricter about this
+    + "(\\S+)\\s+(\\S+)\\s+" // MM-dd-yy whitespace hh:mma|kk:mm swallow trailing spaces
     + "(?:(<DIR>)|([0-9]+))\\s+" // <DIR> or ddddd swallow trailing spaces
     + "(\\S.*)" // First non-space followed by rest of line (name)
 );
@@ -5418,14 +5599,19 @@ const JA_YEAR = "\u5e74";
  *    Note: local listings on MacOSX also use '@'
  *    this is not allowed for here as does not appear to be shown by FTP servers
  *    {@code @}   file has extended attributes
+ *
+ * Keep this expression anchored and both name quantifiers bounded: spaces are allowed in the owner and
+ * group name, so an unbounded pair of them makes a line that can't be parsed cost O(n²) in its length,
+ * which a server could use to block the event loop.
  */
-const RE_LINE = new RegExp("([bcdelfmpSs-])" // file type
+const RE_LINE = new RegExp("^[\\s\\d]*" // anchor, skipping an inode/block count as reported by `ls -i` or `ls -s`
+    + "([bcdelfmpSs-])" // file type
     + "(((r|-)(w|-)([xsStTL-]))((r|-)(w|-)([xsStTL-]))((r|-)(w|-)([xsStTL-]?)))\\+?" // permissions
     + "\\s*" // separator TODO why allow it to be omitted??
     + "(\\d+)" // link count
     + "\\s+" // separator
-    + "(?:(\\S+(?:\\s\\S+)*?)\\s+)?" // owner name (optional spaces)
-    + "(?:(\\S+(?:\\s\\S+)*)\\s+)?" // group name (optional spaces)
+    + "(?:(\\S+(?:\\s\\S+){0,7}?)\\s+)?" // owner name (bounded, may contain spaces)
+    + "(?:(\\S+(?:\\s\\S+){0,7})\\s+)?" // group name (bounded, may contain spaces)
     + "(\\d+(?:,\\s*\\d+)?)" // size or n,m
     + "\\s+" // separator
     /**
@@ -5553,9 +5739,10 @@ exports.parsePasvResponse = parsePasvResponse;
 exports.connectForPassiveTransfer = connectForPassiveTransfer;
 exports.uploadFrom = uploadFrom;
 exports.downloadTo = downloadTo;
-const netUtils_1 = __nccwpck_require__(6288);
 const stream_1 = __nccwpck_require__(2781);
 const tls_1 = __nccwpck_require__(4404);
+const TransferWatchdog_1 = __nccwpck_require__(7926);
+const netUtils_1 = __nccwpck_require__(6288);
 const parseControlResponse_1 = __nccwpck_require__(9948);
 /**
  * Prepare a data socket using passive mode over IPv6.
@@ -5610,9 +5797,11 @@ async function enterPassiveModeIPv4(ftp) {
     return res;
 }
 /**
- * Prepare a data socket using passive mode over IPv4. Ignore the IP provided by the PASV response,
- * and use the control host IP. This is the same behaviour as with the more modern variant EPSV. Use
- * this to fix issues around NAT or provide more security by preventing FTP bounce attacks.
+ * Prepare a data socket using passive mode over IPv4.
+ *
+ * Will throw an error if the IP provided by the PASV response doesn't match the one of the control connection.
+ * The error will contain detailed information. This is done to provide more security by preventing FTP bounce
+ * attacks.
  */
 async function enterPassiveModeIPv4_forceControlHostIP(ftp) {
     const res = await ftp.request("PASV");
@@ -5624,7 +5813,15 @@ async function enterPassiveModeIPv4_forceControlHostIP(ftp) {
     if (controlHost === undefined) {
         throw new Error("Control socket is disconnected, can't get remote address.");
     }
-    await connectForPassiveTransfer(controlHost, target.port, ftp);
+    // Strip IPv4-mapped IPv6 prefix (e.g. "::ffff:1.2.3.4" → "1.2.3.4") so the
+    // comparison works regardless of whether the OS uses a dual-stack socket.
+    const normalizedControlHost = controlHost.replace(/^::ffff:/i, "");
+    const hostsAreCompatible = normalizedControlHost === target.host
+        || ((0, netUtils_1.isLoopback)(normalizedControlHost) && (0, netUtils_1.isLoopback)(target.host));
+    if (!hostsAreCompatible) {
+        throw new Error(`PASV returned another host (${target.host}) for data transfer that you have connected to (${controlHost}). Even though the FTP protocol allows this, basic-ftp disables this feature by default for security reasons. If you do need this feature, instantiate the Client with the optional paramter "allowSeparateTransferHost: true". See the README documentation for more information.`);
+    }
+    await connectForPassiveTransfer(normalizedControlHost, target.port, ftp);
     return res;
 }
 /**
@@ -5643,7 +5840,8 @@ function parsePasvResponse(message) {
 }
 function connectForPassiveTransfer(host, port, ftp) {
     return new Promise((resolve, reject) => {
-        let socket = ftp._newSocket();
+        const rawSocket = ftp._newSocket();
+        let socket = rawSocket;
         const handleConnErr = function (err) {
             err.message = "Can't open data connection in passive mode: " + err.message;
             reject(err);
@@ -5656,16 +5854,22 @@ function connectForPassiveTransfer(host, port, ftp) {
         socket.on("error", handleConnErr);
         socket.on("timeout", handleTimeout);
         socket.connect({ port, host, family: ftp.ipFamily }, () => {
+            var _a;
             if (ftp.socket instanceof tls_1.TLSSocket) {
-                socket = (0, tls_1.connect)(Object.assign({}, ftp.tlsOptions, {
-                    socket,
+                const tlsSocket = (0, tls_1.connect)(Object.assign({}, ftp.tlsOptions, {
+                    socket: rawSocket,
                     // Reuse the TLS session negotiated earlier when the control connection
                     // was upgraded. Servers expect this because it provides additional
                     // security: If a completely new session would be negotiated, a hacker
                     // could guess the port and connect to the new data connection before we do
                     // by just starting his/her own TLS session.
-                    session: ftp.socket.getSession()
+                    session: (_a = ftp.tlsSessionStore) !== null && _a !== void 0 ? _a : ftp.socket.getSession()
                 }));
+                // When the server issues a new session ticket after this data connection's
+                // TLS handshake (TLS 1.3 single-use tickets), capture it so the next data
+                // connection can present a fresh ticket and resume successfully.
+                tlsSocket.on("session", session => { ftp.tlsSessionStore = session; });
+                socket = tlsSocket;
                 // It's the responsibility of the transfer task to wait until the
                 // TLS socket issued the event 'secureConnect'. We can't do this
                 // here because some servers will start upgrading after the
@@ -5674,6 +5878,11 @@ function connectForPassiveTransfer(host, port, ftp) {
                 // is ready. But for upload this has to be taken into account,
                 // see the details in the upload() function below.
             }
+            // Disable the timeout that was guarding the connection attempt. This has to happen on
+            // the socket it was set on: when using TLS, `socket` is by now a wrapper around that
+            // socket, and a timeout left running underneath would destroy the data connection
+            // during a transfer that is idle for a legitimate reason.
+            rawSocket.setTimeout(0);
             // Let the FTPContext listen to errors from now on, remove local handler.
             socket.removeListener("error", handleConnErr);
             socket.removeListener("timeout", handleTimeout);
@@ -5699,6 +5908,8 @@ class TransferResolver {
         this.progress = progress;
         this.response = undefined;
         this.dataTransferDone = false;
+        this.taskSettled = false;
+        this.watchdog = new TransferWatchdog_1.TransferWatchdog();
     }
     /**
      * Mark the beginning of a transfer.
@@ -5707,7 +5918,7 @@ class TransferResolver {
      * @param type - Type of transfer, usually "upload" or "download".
      */
     onDataStart(name, type) {
-        // Let the data socket be in charge of tracking timeouts during transfer.
+        // Let the data connection be in charge of tracking timeouts during transfer.
         // The control socket sits idle during this time anyway and might provoke
         // a timeout unnecessarily. The control connection will take care
         // of timeouts again once data transfer is complete or failed.
@@ -5715,22 +5926,28 @@ class TransferResolver {
             throw new Error("Data transfer should start but there is no data connection.");
         }
         this.ftp.socket.setTimeout(0);
-        this.ftp.dataSocket.setTimeout(this.ftp.timeout);
+        // An inactivity timeout on the data socket would also fire while a slow local source or
+        // destination is holding up an otherwise healthy transfer. Watch the transfer instead.
+        this.ftp.dataSocket.setTimeout(0);
+        this.watchdog.start(this.ftp.dataSocket, type === "upload" ? "upload" : "download", this.ftp.timeout, () => {
+            this.ftp.closeWithError(new Error("Timeout (data socket)"));
+        });
         this.progress.start(this.ftp.dataSocket, name, type);
     }
     /**
      * The data connection has finished the transfer.
      */
     onDataDone(task) {
+        if (this.taskSettled) {
+            return;
+        }
+        this.watchdog.stop();
         this.progress.updateAndStop();
         // Hand-over timeout tracking back to the control connection. It's possible that
         // we don't receive the response over the control connection that the transfer is
         // done. In this case, we want to correctly associate the resulting timeout with
         // the control connection.
         this.ftp.socket.setTimeout(this.ftp.timeout);
-        if (this.ftp.dataSocket) {
-            this.ftp.dataSocket.setTimeout(0);
-        }
         this.dataTransferDone = true;
         this.tryResolve(task);
     }
@@ -5745,6 +5962,15 @@ class TransferResolver {
      * An error has been reported and the task should be rejected.
      */
     onError(task, err) {
+        // A transfer can report a problem more than once, e.g. when the server sends an error
+        // response and the stream of the data connection reports the resulting shutdown as an
+        // error as well. Only the first one decides the outcome, acting on a later one would
+        // interfere with whatever the client is doing by then.
+        if (this.taskSettled) {
+            return;
+        }
+        this.taskSettled = true;
+        this.watchdog.stop();
         this.progress.updateAndStop();
         this.ftp.socket.setTimeout(this.ftp.timeout);
         this.ftp.dataSocket = undefined;
@@ -5763,6 +5989,7 @@ class TransferResolver {
         // To resolve, we need both control and data connection to report that the transfer is done.
         const canResolve = this.dataTransferDone && this.response !== undefined;
         if (canResolve) {
+            this.taskSettled = true;
             this.ftp.dataSocket = undefined;
             task.resolve(this.response);
         }
@@ -5771,11 +5998,21 @@ class TransferResolver {
 function uploadFrom(source, config) {
     const resolver = new TransferResolver(config.ftp, config.tracker);
     const fullCommand = `${config.command} ${config.remotePath}`;
+    // This handler runs for every reply that arrives while the task is active. RFC 959 lists
+    // "125" and "150" as alternatives, so a well-behaved server sends exactly one of them, but
+    // nothing here enforces that. Let only the first one start the transfer: piping the source
+    // into the data connection a second time writes parts of it twice and would silently
+    // corrupt the remote file.
+    let transferStarted = false;
     return config.ftp.handle(fullCommand, (res, task) => {
         if (res instanceof Error) {
             resolver.onError(task, res);
         }
         else if (res.code === 150 || res.code === 125) { // Ready to upload
+            if (transferStarted) {
+                return;
+            }
+            transferStarted = true;
             const dataSocket = config.ftp.dataSocket;
             if (!dataSocket) {
                 resolver.onError(task, new Error("Upload should begin but no data connection is available."));
@@ -5811,11 +6048,17 @@ function downloadTo(destination, config) {
         throw new Error("Download will be initiated but no data connection is available.");
     }
     const resolver = new TransferResolver(config.ftp, config.tracker);
+    // See the comment in uploadFrom(): only the first preliminary reply may start the transfer.
+    let transferStarted = false;
     return config.ftp.handle(config.command, (res, task) => {
         if (res instanceof Error) {
             resolver.onError(task, res);
         }
         else if (res.code === 150 || res.code === 125) { // Ready to download
+            if (transferStarted) {
+                return;
+            }
+            transferStarted = true;
             const dataSocket = config.ftp.dataSocket;
             if (!dataSocket) {
                 resolver.onError(task, new Error("Download should begin but no data connection is available."));
@@ -5823,6 +6066,10 @@ function downloadTo(destination, config) {
             }
             config.ftp.log(`Downloading from ${(0, netUtils_1.describeAddress)(dataSocket)} (${(0, netUtils_1.describeTLS)(dataSocket)})`);
             resolver.onDataStart(config.remotePath, config.type);
+            // Keep piping the data connection: TransferWatchdog recognizes a destination that
+            // can't keep up by the socket being paused, and only piping does that. Consuming the
+            // socket in another way, e.g. by iterating over it, makes the watchdog report a
+            // transfer as stalled while it's in fact waiting for us.
             (0, stream_1.pipeline)(dataSocket, destination, err => {
                 if (err) {
                     resolver.onError(task, err);
